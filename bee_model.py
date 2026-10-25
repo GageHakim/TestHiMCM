@@ -7,12 +7,12 @@ State variables (number of adult bees):
     P = H + F   : total colony
 
 Model as written on the whiteboard:
-    dH/dt = K1 * F * H / sqrt(F + H)  -  K2 * H / F  -  g1 * H
+    dH/dt = K1 * (F * H)**b / sqrt(F + H)  -  K2 * H / F  -  g1 * H   (b = 1 as written)
     dF/dt = K2 * H / F  -  K3 * F**a  -  g2 * F          (a = 1/2 as written)
     dP/dt = dH/dt + dF/dt
 
 Term meanings (our reading):
-    K1 * F*H/sqrt(F+H) : new adults emerging (needs foragers for food, hive bees for brood care)
+    K1 * (F*H)**b/sqrt(F+H) : new adults emerging (needs foragers for food, hive bees for brood care)
     K2 * H/F           : hive bees recruited to foraging (more recruitment when foragers are scarce)
     K3 * F**a          : extra forager loss (e.g. lost while foraging / predation / pesticide)
     g1, g2             : background per-capita death rates
@@ -42,20 +42,21 @@ class Params:
     K2: float = 800.0      # recruitment coefficient      [bees / day]
     K3: float = 1.0        # extra forager loss coeff.    [bees^(1-a) / day]
     a: float = 0.5         # exponent on F in the K3 term (whiteboard: 1/2)
+    b: float = 1.0         # exponent on F*H in births (whiteboard: 1; sqrt variant: 1/2)
     g1: float = 0.01       # hive-bee death rate          [1/day]
     g2: float = 0.15       # forager death rate           [1/day]
 
 
-def calibrate(H_star, F_star, g1=0.01, g2=0.15, K3=1.0, a=0.5):
+def calibrate(H_star, F_star, g1=0.01, g2=0.15, K3=1.0, a=0.5, b=1.0):
     """Pick K1, K2 so that (H_star, F_star) is an equilibrium of the whiteboard model."""
     K2 = F_star / H_star * (K3 * F_star**a + g2 * F_star)
-    K1 = (K2 * H_star / F_star + g1 * H_star) * np.sqrt(H_star + F_star) / (F_star * H_star)
-    return Params(K1=K1, K2=K2, K3=K3, a=a, g1=g1, g2=g2)
+    K1 = (K2 * H_star / F_star + g1 * H_star) * np.sqrt(H_star + F_star) / (F_star * H_star)**b
+    return Params(K1=K1, K2=K2, K3=K3, a=a, b=b, g1=g1, g2=g2)
 
 
 def rhs(t, y, p: Params):
     H, F = np.maximum(y, 0.0)
-    births = p.K1 * F * H / np.sqrt(F + H + EPS)
+    births = p.K1 * (F * H)**p.b / np.sqrt(F + H + EPS)
     recruit = p.K2 * H / (F + EPS)
     dH = births - recruit - p.g1 * H
     dF = recruit - p.K3 * F**p.a - p.g2 * F
@@ -112,27 +113,28 @@ def simulate(f, y0, params, t_end=365.0):
 def main():
     # Calibrate so a 30,000-bee colony (20k hive / 10k foragers) is an equilibrium.
     H_star, F_star = 20000.0, 10000.0
-    p = calibrate(H_star, F_star)
-    print("Whiteboard model parameters:", p)
+    fig, axes = plt.subplots(1, 3, figsize=(17, 4.5))
 
-    eig = np.linalg.eigvals(jacobian(H_star, F_star, p))
-    print(f"Equilibrium (H, F) = ({H_star:.0f}, {F_star:.0f}); Jacobian eigenvalues = {eig}")
-    print("  -> stable" if np.all(eig.real < 0) else "  -> UNSTABLE (saddle/source)")
+    variants = [(1.0, "Whiteboard model (F*H)"), (0.5, "Sqrt variant (sqrt(F*H))")]
+    for ax, (b, name) in zip(axes, variants):
+        p = calibrate(H_star, F_star, b=b)
+        print(f"{name} parameters:", p)
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharey=False)
+        eig = np.linalg.eigvals(jacobian(H_star, F_star, p))
+        print(f"Equilibrium (H, F) = ({H_star:.0f}, {F_star:.0f}); Jacobian eigenvalues = {eig}")
+        print("  -> stable" if np.all(eig.real < 0) else "  -> UNSTABLE (saddle/source)")
 
-    ax = axes[0]
-    for scale, ls in [(0.9, "--"), (1.0, "-"), (1.1, ":")]:
-        sol = simulate(rhs, [scale * H_star, scale * F_star], p)
-        H, F = sol.y
-        end = f"blows up at t={sol.t[-1]:.0f} d" if sol.status == 1 else f"t={sol.t[-1]:.0f} d"
-        print(f"  start at {scale:.0%} of equilibrium: final N = {max(H[-1] + F[-1], 0):,.0f} ({end})")
-        ax.plot(sol.t, H + F, ls, label=f"start {scale:.0%} of eq. ({end})")
-    ax.set_title("Whiteboard model: total colony P(t)")
-    ax.set_xlabel("day"); ax.set_ylabel("bees"); ax.set_yscale("symlog", linthresh=100)
-    ax.legend(fontsize=8)
+        for scale, ls in [(0.01, "-."), (0.9, "--"), (1.0, "-"), (1.1, ":"), (2.0, "-")]:
+            sol = simulate(rhs, [scale * H_star, scale * F_star], p)
+            H, F = sol.y
+            end = f"blows up at t={sol.t[-1]:.0f} d" if sol.status == 1 else f"t={sol.t[-1]:.0f} d"
+            print(f"  start at {scale:.0%} of equilibrium: final N = {max(H[-1] + F[-1], 0):,.0f} ({end})")
+            ax.plot(sol.t, H + F, ls, label=f"start {scale:.0%} of eq. ({end})")
+        ax.set_title(f"{name}: total colony P(t)")
+        ax.set_xlabel("day"); ax.set_ylabel("bees"); ax.set_yscale("symlog", linthresh=100)
+        ax.legend(fontsize=8)
 
-    ax = axes[1]
+    ax = axes[2]
     rp = RevisedParams()
     for y0 in [[5000, 1000], [16000, 8000], [40000, 20000]]:
         sol = simulate(rhs_revised, y0, rp)
@@ -143,7 +145,6 @@ def main():
     fig.tight_layout()
     fig.savefig("bee_model.png", dpi=150)
     print("Saved bee_model.png")
-
 
 if __name__ == "__main__":
     main()
