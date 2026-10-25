@@ -6,16 +6,20 @@ State variables (number of adult bees):
     F = P_for   : foragers
     P = H + F   : total colony
 
-Model as written on the whiteboard:
-    dH/dt = K1 * (F * H)**b / sqrt(F + H)  -  K2 * H / F  -  g1 * H   (b = 1 as written)
-    dF/dt = K2 * H / F  -  K3 * F**a  -  g2 * F          (a = 1/2 as written)
+Model:
+    dH/dt = K1 * sqrt(F)  -  K2 * H / F  -  g1 * H
+    dF/dt = K2 * H / F  -  K3 * F**(3/2)  -  g2 * F
     dP/dt = dH/dt + dF/dt
 
-Term meanings (our reading):
-    K1 * (F*H)**b/sqrt(F+H) : new adults emerging (needs foragers for food, hive bees for brood care)
-    K2 * H/F           : hive bees recruited to foraging (more recruitment when foragers are scarce)
-    K3 * F**a          : extra forager loss (e.g. lost while foraging / predation / pesticide)
-    g1, g2             : background per-capita death rates
+Term meanings:
+    K1 * sqrt(F)   : births, proportional to food income. Foragers need a foraging area
+                     proportional to F, so the radius (and trip length) grows like sqrt(F);
+                     each forager brings in food at a rate ~ 1/sqrt(F), so total food
+                     ~ F / sqrt(F) = sqrt(F). Each new bee costs a fixed amount of food.
+    K2 * H / F     : hive bees recruited to foraging (more recruitment when foragers are scarce)
+    K3 * F**(3/2)  : foraging-distance deaths. Each forager's risk grows with trip length
+                     ~ sqrt(F), so total deaths ~ F * sqrt(F).
+    g1, g2         : background per-capita death rates
 
 Also included: a "revised" model with a queen-limited birth rate and
 social-inhibition recruitment (Khoury, Myerscough & Barron 2011, PLoS ONE 6(4):e18491)
@@ -34,32 +38,30 @@ EPS = 1e-9  # keeps H/F and sqrt finite when a compartment hits zero
 
 
 # --------------------------------------------------------------------------
-# Whiteboard model
+# Main model
 # --------------------------------------------------------------------------
 @dataclass
 class Params:
-    K1: float = 1.559e-3   # birth coefficient            [bees^(-1/2) / day]
-    K2: float = 800.0      # recruitment coefficient      [bees / day]
-    K3: float = 1.0        # extra forager loss coeff.    [bees^(1-a) / day]
-    a: float = 0.5         # exponent on F in the K3 term (whiteboard: 1/2)
-    b: float = 1.0         # exponent on F*H in births (whiteboard: 1; sqrt variant: 1/2)
-    g1: float = 0.01       # hive-bee death rate          [1/day]
-    g2: float = 0.15       # forager death rate           [1/day]
+    K1: float = 18.0       # births per sqrt(forager)      [bees^(1/2) / day]
+    K2: float = 800.0      # recruitment coefficient       [bees / day]
+    K3: float = 1e-4       # distance-death coefficient    [bees^(-1/2) / day]
+    g1: float = 0.01       # hive-bee death rate           [1/day]
+    g2: float = 0.15       # forager death rate            [1/day]
 
 
-def calibrate(H_star, F_star, g1=0.01, g2=0.15, K3=1.0, a=0.5, b=1.0):
-    """Pick K1, K2 so that (H_star, F_star) is an equilibrium of the whiteboard model."""
-    K2 = F_star / H_star * (K3 * F_star**a + g2 * F_star)
-    K1 = (K2 * H_star / F_star + g1 * H_star) * np.sqrt(H_star + F_star) / (F_star * H_star)**b
-    return Params(K1=K1, K2=K2, K3=K3, a=a, b=b, g1=g1, g2=g2)
+def calibrate(H_star, F_star, g1=0.01, g2=0.15, K3=1e-4):
+    """Pick K1, K2 so that (H_star, F_star) is an equilibrium of the model."""
+    K2 = F_star / H_star * (K3 * F_star**1.5 + g2 * F_star)
+    K1 = (K2 * H_star / F_star + g1 * H_star) / np.sqrt(F_star)
+    return Params(K1=K1, K2=K2, K3=K3, g1=g1, g2=g2)
 
 
 def rhs(t, y, p: Params):
     H, F = np.maximum(y, 0.0)
-    births = p.K1 * (F * H)**p.b / np.sqrt(F + H + EPS)
+    births = p.K1 * np.sqrt(F)
     recruit = p.K2 * H / (F + EPS)
     dH = births - recruit - p.g1 * H
-    dF = recruit - p.K3 * F**p.a - p.g2 * F
+    dF = recruit - p.K3 * F**1.5 - p.g2 * F
     return [dH, dF]
 
 
@@ -113,26 +115,28 @@ def simulate(f, y0, params, t_end=365.0):
 def main():
     # Calibrate so a 30,000-bee colony (20k hive / 10k foragers) is an equilibrium.
     H_star, F_star = 20000.0, 10000.0
+    p = calibrate(H_star, F_star)
+    print("Model parameters:", p)
+
+    eig = np.linalg.eigvals(jacobian(H_star, F_star, p))
+    print(f"Equilibrium (H, F) = ({H_star:.0f}, {F_star:.0f}); Jacobian eigenvalues = {eig}")
+    print("  -> stable" if np.all(eig.real < 0) else "  -> UNSTABLE (saddle/source)")
+
     fig, axes = plt.subplots(1, 3, figsize=(17, 4.5))
 
-    variants = [(1.0, "Whiteboard model (F*H)"), (0.5, "Sqrt variant (sqrt(F*H))")]
-    for ax, (b, name) in zip(axes, variants):
-        p = calibrate(H_star, F_star, b=b)
-        print(f"{name} parameters:", p)
-
-        eig = np.linalg.eigvals(jacobian(H_star, F_star, p))
-        print(f"Equilibrium (H, F) = ({H_star:.0f}, {F_star:.0f}); Jacobian eigenvalues = {eig}")
-        print("  -> stable" if np.all(eig.real < 0) else "  -> UNSTABLE (saddle/source)")
-
-        for scale, ls in [(0.01, "-."), (0.9, "--"), (1.0, "-"), (1.1, ":"), (2.0, "-")]:
-            sol = simulate(rhs, [scale * H_star, scale * F_star], p)
-            H, F = sol.y
-            end = f"blows up at t={sol.t[-1]:.0f} d" if sol.status == 1 else f"t={sol.t[-1]:.0f} d"
-            print(f"  start at {scale:.0%} of equilibrium: final N = {max(H[-1] + F[-1], 0):,.0f} ({end})")
-            ax.plot(sol.t, H + F, ls, label=f"start {scale:.0%} of eq. ({end})")
-        ax.set_title(f"{name}: total colony P(t)")
-        ax.set_xlabel("day"); ax.set_ylabel("bees"); ax.set_yscale("symlog", linthresh=100)
-        ax.legend(fontsize=8)
+    for scale in [0.01, 0.5, 1.0, 2.0]:
+        sol = simulate(rhs, [scale * H_star, scale * F_star], p)
+        H, F = sol.y
+        end = f"blows up at t={sol.t[-1]:.0f} d" if sol.status == 1 else f"t={sol.t[-1]:.0f} d"
+        print(f"  start at {scale:.0%} of equilibrium: final H = {max(H[-1], 0):,.0f}, "
+              f"F = {max(F[-1], 0):,.0f} ({end})")
+        line, = axes[0].plot(sol.t, H + F, label=f"start {scale:.0%} of eq.")
+        axes[1].plot(sol.t, H, color=line.get_color())
+        axes[1].plot(sol.t, F, "--", color=line.get_color())
+    axes[0].set_title("Model: total colony P(t)")
+    axes[0].set_xlabel("day"); axes[0].set_ylabel("bees"); axes[0].legend(fontsize=8)
+    axes[1].set_title("Model: hive bees H (solid) and foragers F (dashed)")
+    axes[1].set_xlabel("day"); axes[1].set_ylabel("bees")
 
     ax = axes[2]
     rp = RevisedParams()
@@ -145,6 +149,7 @@ def main():
     fig.tight_layout()
     fig.savefig("bee_model.png", dpi=150)
     print("Saved bee_model.png")
+
 
 if __name__ == "__main__":
     main()
