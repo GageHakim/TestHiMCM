@@ -21,6 +21,9 @@ Term meanings:
                      ~ sqrt(F), so total deaths ~ F * sqrt(F).
     g1, g2         : background per-capita death rates
 
+Parameters are rough literature estimates (see Params) except K3, which has no good
+data and is treated as a free parameter. The equilibrium colony size is an OUTPUT.
+
 Also included: a "revised" model with a queen-limited birth rate and
 social-inhibition recruitment (Khoury, Myerscough & Barron 2011, PLoS ONE 6(4):e18491)
 for comparison.
@@ -33,27 +36,50 @@ from dataclasses import dataclass
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.integrate import solve_ivp
+from scipy.optimize import brentq
 
 EPS = 1e-9  # keeps H/F and sqrt finite when a compartment hits zero
+
+# K1 and K2 multiply terms that are not scale-free (sqrt(F) and H/F), so field
+# measurements of per-bee rates have to be tied to the colony they were measured in.
+F_REF = 10000.0  # foragers in a typical field colony where per-bee rates are measured
 
 
 # --------------------------------------------------------------------------
 # Main model
 # --------------------------------------------------------------------------
+# K1: pollen budget. ~20% of foragers collect pollen, ~7 trips/day, ~15 mg per trip
+#     => ~21 mg pollen per forager per day; raising one worker takes ~140 mg pollen
+#     (Brodschneider & Crailsheim 2010). So ~0.15 new bees per forager per day at F_REF,
+#     and K1 = 0.15 * sqrt(F_REF). Sanity check: 1,500 births/day at F_REF, matching
+#     a queen's typical 1,500-2,000 eggs/day (Winston 1987).
+BIRTHS_PER_FORAGER = 0.2 * 7 * 15 / 140
+
+# K2: workers start foraging at ~21 days old (Winston 1987), so a hive bee leaves the
+#     hive compartment at total rate ~1/21 per day = recruitment K2/F + death g1.
+AGE_AT_FORAGING = 21.0
+
+
 @dataclass
 class Params:
-    K1: float = 18.0       # births per sqrt(forager)      [bees^(1/2) / day]
-    K2: float = 800.0      # recruitment coefficient       [bees / day]
-    K3: float = 1e-4       # distance-death coefficient    [bees^(-1/2) / day]
-    g1: float = 0.01       # hive-bee death rate           [1/day]
-    g2: float = 0.15       # forager death rate            [1/day]
+    K1: float = BIRTHS_PER_FORAGER * np.sqrt(F_REF)   # ~15   [bees^(1/2) / day]
+    K2: float = (1 / AGE_AT_FORAGING - 0.01) * F_REF  # ~380  [bees / day]
+    K3: float = 1e-4   # distance deaths: NO DATA, free parameter  [bees^(-1/2) / day]
+    g1: float = 0.01   # hive bees: low mortality, ~1%/day                 [1/day]
+    g2: float = 0.154  # foragers live ~1 week after they start foraging   [1/day]
 
 
-def calibrate(H_star, F_star, g1=0.01, g2=0.15, K3=1e-4):
-    """Pick K1, K2 so that (H_star, F_star) is an equilibrium of the model."""
-    K2 = F_star / H_star * (K3 * F_star**1.5 + g2 * F_star)
-    K1 = (K2 * H_star / F_star + g1 * H_star) / np.sqrt(F_star)
-    return Params(K1=K1, K2=K2, K3=K3, g1=g1, g2=g2)
+def equilibrium(p: Params):
+    """Unique positive equilibrium (H*, F*).
+
+    dH/dt = 0  ->  H = K1 F^(3/2) / (K2 + g1 F)
+    dF/dt = 0  ->  K1 K2 / (K2 + g1 F) = K3 F + g2 sqrt(F)
+    The left side decreases in F and the right side increases, so there is one root.
+    """
+    F = brentq(lambda F: p.K1 * p.K2 / (p.K2 + p.g1 * F) - p.K3 * F - p.g2 * np.sqrt(F),
+               1e-9, 1e9)
+    H = p.K1 * F**1.5 / (p.K2 + p.g1 * F)
+    return H, F
 
 
 def rhs(t, y, p: Params):
@@ -113,32 +139,49 @@ def simulate(f, y0, params, t_end=365.0):
 
 
 def main():
-    # Calibrate so a 30,000-bee colony (20k hive / 10k foragers) is an equilibrium.
-    H_star, F_star = 20000.0, 10000.0
-    p = calibrate(H_star, F_star)
+    p = Params()
     print("Model parameters:", p)
 
+    H_star, F_star = equilibrium(p)
     eig = np.linalg.eigvals(jacobian(H_star, F_star, p))
-    print(f"Equilibrium (H, F) = ({H_star:.0f}, {F_star:.0f}); Jacobian eigenvalues = {eig}")
-    print("  -> stable" if np.all(eig.real < 0) else "  -> UNSTABLE (saddle/source)")
+    print(f"Equilibrium: H = {H_star:,.0f}, F = {F_star:,.0f}, P = {H_star + F_star:,.0f}")
+    print(f"  births = {p.K1 * np.sqrt(F_star):,.0f}/day, "
+          f"distance deaths = {p.K3 * F_star**1.5:,.0f}/day")
+    print(f"  Jacobian eigenvalues = {eig}",
+          "-> stable" if np.all(eig.real < 0) else "-> UNSTABLE (saddle/source)")
 
-    fig, axes = plt.subplots(1, 3, figsize=(17, 4.5))
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
 
-    for scale in [0.01, 0.5, 1.0, 2.0]:
-        sol = simulate(rhs, [scale * H_star, scale * F_star], p)
+    for start in [(200, 100), (8000, 4000), (40000, 20000)]:
+        sol = simulate(rhs, start, p)
         H, F = sol.y
-        end = f"blows up at t={sol.t[-1]:.0f} d" if sol.status == 1 else f"t={sol.t[-1]:.0f} d"
-        print(f"  start at {scale:.0%} of equilibrium: final H = {max(H[-1], 0):,.0f}, "
-              f"F = {max(F[-1], 0):,.0f} ({end})")
-        line, = axes[0].plot(sol.t, H + F, label=f"start {scale:.0%} of eq.")
-        axes[1].plot(sol.t, H, color=line.get_color())
-        axes[1].plot(sol.t, F, "--", color=line.get_color())
-    axes[0].set_title("Model: total colony P(t)")
-    axes[0].set_xlabel("day"); axes[0].set_ylabel("bees"); axes[0].legend(fontsize=8)
-    axes[1].set_title("Model: hive bees H (solid) and foragers F (dashed)")
-    axes[1].set_xlabel("day"); axes[1].set_ylabel("bees")
+        print(f"  start H={start[0]:,}, F={start[1]:,}: after {sol.t[-1]:.0f} d "
+              f"H = {max(H[-1], 0):,.0f}, F = {max(F[-1], 0):,.0f}")
+        line, = axes[0, 0].plot(sol.t, H + F, label=f"start H={start[0]:,}, F={start[1]:,}")
+        axes[0, 1].plot(sol.t, H, color=line.get_color())
+        axes[0, 1].plot(sol.t, F, "--", color=line.get_color())
+    axes[0, 0].axhline(H_star + F_star, color="gray", lw=0.8, ls=":")
+    axes[0, 0].set_title("Model: total colony P(t)")
+    axes[0, 0].set_xlabel("day"); axes[0, 0].set_ylabel("bees"); axes[0, 0].legend(fontsize=8)
+    axes[0, 1].set_title("Model: hive bees H (solid) and foragers F (dashed)")
+    axes[0, 1].set_xlabel("day"); axes[0, 1].set_ylabel("bees")
 
-    ax = axes[2]
+    # K3 has no data: show how the equilibrium depends on it.
+    print("Equilibrium vs K3:")
+    K3s = np.logspace(-7, -2, 60)
+    eq = np.array([equilibrium(Params(K3=k)) for k in K3s])
+    for k in [0.0, 1e-5, 1e-4, 1e-3, 1e-2]:
+        H, F = equilibrium(Params(K3=k))
+        print(f"  K3 = {k:g}: P = {H + F:,.0f} (H = {H:,.0f}, F = {F:,.0f})")
+    ax = axes[1, 0]
+    ax.semilogx(K3s, eq.sum(axis=1), label="total P*")
+    ax.semilogx(K3s, eq[:, 0], label="hive H*")
+    ax.semilogx(K3s, eq[:, 1], "--", label="foragers F*")
+    ax.axhspan(20000, 60000, color="gray", alpha=0.15, label="typical colony 20k-60k")
+    ax.set_title("Equilibrium colony size vs distance-death K3")
+    ax.set_xlabel("K3"); ax.set_ylabel("bees"); ax.legend(fontsize=8)
+
+    ax = axes[1, 1]
     rp = RevisedParams()
     for y0 in [[5000, 1000], [16000, 8000], [40000, 20000]]:
         sol = simulate(rhs_revised, y0, rp)
